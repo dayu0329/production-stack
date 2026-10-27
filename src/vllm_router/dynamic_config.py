@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
+import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Literal, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 
@@ -24,14 +27,22 @@ from vllm_router.log import init_logger
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
-from vllm_router.routers.routing_logic import reconfigure_routing_logic
+from vllm_router.routers.routing_logic import (
+    LeastQueueRouter,
+    RoundRobinRouter,
+    reconfigure_routing_logic,
+)
 from vllm_router.service_discovery import (
     ServiceDiscoveryType,
+    StaticServiceDiscovery,
+    get_service_discovery,
     reconfigure_service_discovery,
+    swap_service_discovery,
 )
 from vllm_router.services.callbacks_service.callbacks import configure_custom_callbacks
 from vllm_router.utils import (
     SingletonMeta,
+    ModelType,
     parse_comma_separated_args,
     parse_static_aliases,
     parse_static_urls,
@@ -68,6 +79,10 @@ class DynamicRouterConfig:
 
     # Routing logic configurations
     session_key: Optional[str] = None
+    leastqueue_metrics_max_age: float = 5.0
+    leastqueue_reservation_ttl: float = 1.0
+    engine_stats_interval: float = 30.0
+    max_instance_failover_reroute_attempts: int = 0
     priority_header: Optional[str] = "x-request-priority"
     priority_field: Optional[str] = "priority"
     priority_default: Optional[int] = 0
@@ -101,12 +116,20 @@ class DynamicRouterConfig:
             static_backend_health_checks=args.static_backend_health_checks,
             static_backend_health_check_interval=args.static_backend_health_check_interval,
             static_backend_health_check_timeout_seconds=args.static_backend_health_check_timeout_seconds,
-            k8s_port=args.k8s_port,
-            k8s_namespace=args.k8s_namespace,
-            k8s_label_selector=args.k8s_label_selector,
+            k8s_port=args.k8s_port if args.service_discovery == "k8s" else None,
+            k8s_namespace=(
+                args.k8s_namespace if args.service_discovery == "k8s" else None
+            ),
+            k8s_label_selector=(
+                args.k8s_label_selector if args.service_discovery == "k8s" else None
+            ),
             # Routing logic configurations
             routing_logic=args.routing_logic,
             session_key=args.session_key,
+            leastqueue_metrics_max_age=getattr(args, "leastqueue_metrics_max_age", 5.0),
+            leastqueue_reservation_ttl=getattr(args, "leastqueue_reservation_ttl", 1.0),
+            engine_stats_interval=args.engine_stats_interval,
+            max_instance_failover_reroute_attempts=args.max_instance_failover_reroute_attempts,
             priority_header=args.priority_header,
             priority_field=args.priority_field,
             priority_default=args.priority_default,
@@ -128,6 +151,78 @@ class DynamicRouterConfig:
 
     def to_json_str(self) -> str:
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
+
+    def validate(self):
+        for name in (
+            "engine_stats_interval",
+            "leastqueue_metrics_max_age",
+            "static_backend_health_check_interval",
+            "static_backend_health_check_timeout_seconds",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be positive and finite")
+        value = self.leastqueue_reservation_ttl
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "leastqueue_reservation_ttl must be nonnegative and finite"
+            )
+        attempts = self.max_instance_failover_reroute_attempts
+        if type(attempts) is not int or attempts < 0:
+            raise ValueError(
+                "max_instance_failover_reroute_attempts must be a nonnegative integer"
+            )
+        if type(self.static_backend_health_checks) is not bool:
+            raise ValueError("static_backend_health_checks must be a boolean")
+        if self.service_discovery == "static":
+            if not isinstance(self.static_backends, str) or not isinstance(
+                self.static_models, str
+            ):
+                raise ValueError("Static backends and models must be configured")
+            urls = self.static_backends.split(",")
+            models = parse_comma_separated_args(self.static_models)
+            if not urls or not models or any(not model.strip() for model in models):
+                raise ValueError("At least one backend and model are required")
+            for url in urls:
+                parsed = urlsplit(url)
+                if (
+                    parsed.scheme not in ("http", "https")
+                    or not parsed.hostname
+                    or parsed.query
+                    or parsed.fragment
+                    or parsed.username
+                    or parsed.password
+                    or parsed.path not in ("", "/")
+                ):
+                    raise ValueError(f"Invalid backend base URL: {url}")
+                parsed.port
+            labels = parse_comma_separated_args(self.static_model_labels)
+            types = parse_comma_separated_args(self.static_model_types)
+            StaticServiceDiscovery._validate_index_aligned_lists(
+                urls, models, labels, types
+            )
+            if len(set(zip(urls, models))) != len(urls):
+                raise ValueError("Duplicate backend/model pair")
+            if self.static_backend_health_checks and not types:
+                raise ValueError("Health checks require static_model_types")
+            if types and any(
+                model_type not in ModelType.get_all_fields() for model_type in types
+            ):
+                raise ValueError("Unsupported static model type")
+            if self.static_aliases:
+                aliases = parse_static_aliases(self.static_aliases)
+                if any(model not in models for model in aliases.values()):
+                    raise ValueError("Alias target must be a configured model")
 
 
 class DynamicConfigWatcher(metaclass=SingletonMeta):
@@ -156,6 +251,7 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         self.config_file_type = config_file_type
         self.watch_interval = watch_interval
         self.current_config = init_config
+        init_config.validate()
         self.app = app
 
         # Watcher thread
@@ -222,6 +318,9 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         routing_logic = reconfigure_routing_logic(
             config.routing_logic,
             session_key=config.session_key,
+            leastqueue_metrics_max_age=config.leastqueue_metrics_max_age,
+            leastqueue_reservation_ttl=config.leastqueue_reservation_ttl,
+            max_instance_failover_reroute_attempts=config.max_instance_failover_reroute_attempts,
             priority_header=config.priority_header,
             priority_field=config.priority_field,
             priority_default=config.priority_default,
@@ -245,8 +344,9 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         Reconfigures the router with the given config.
         """
-        # TODO (ApostaC): Implement reconfigure_stats
-        pass
+        self.app.state.engine_stats_scraper.update_interval(
+            config.engine_stats_interval
+        )
 
     def reconfigure_callbacks(self, config: DynamicRouterConfig):
         """
@@ -261,11 +361,109 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         """
         Reconfigures the router with the given config.
         """
+        config.validate()
+        if (
+            self.current_config.service_discovery == "static"
+            and self.current_config.routing_logic in ("leastqueue", "roundrobin")
+        ):
+            return self._reconfigure_static(config)
         self.reconfigure_service_discovery(config)
         self.reconfigure_routing_logic(config)
         self.reconfigure_batch_api(config)
         self.reconfigure_stats(config)
         self.reconfigure_callbacks(config)
+
+    def _reconfigure_static(self, config):
+        if config.service_discovery != "static" or config.routing_logic not in (
+            "leastqueue",
+            "roundrobin",
+        ):
+            raise ValueError(
+                "Live static updates support leastqueue and roundrobin only"
+            )
+        supported = {
+            "static_backends",
+            "static_models",
+            "static_aliases",
+            "static_model_labels",
+            "static_model_types",
+            "static_backend_health_checks",
+            "static_backend_health_check_interval",
+            "static_backend_health_check_timeout_seconds",
+            "routing_logic",
+            "leastqueue_metrics_max_age",
+            "leastqueue_reservation_ttl",
+            "engine_stats_interval",
+            "max_instance_failover_reroute_attempts",
+        }
+        changed = {
+            field.name
+            for field in fields(config)
+            if getattr(config, field.name) != getattr(self.current_config, field.name)
+        }
+        if changed - supported:
+            raise ValueError(f"Fields require restart: {sorted(changed - supported)}")
+        old_discovery = get_service_discovery()
+        new_discovery = None
+        if any(name.startswith("static_") for name in changed):
+            new_discovery = StaticServiceDiscovery(
+                app=self.app,
+                urls=config.static_backends.split(","),
+                models=parse_comma_separated_args(config.static_models),
+                aliases=(
+                    parse_static_aliases(config.static_aliases)
+                    if config.static_aliases
+                    else None
+                ),
+                model_labels=parse_comma_separated_args(config.static_model_labels),
+                model_types=parse_comma_separated_args(config.static_model_types),
+                static_backend_health_checks=False,
+                static_backend_health_check_interval=config.static_backend_health_check_interval,
+                static_backend_health_check_timeout_seconds=config.static_backend_health_check_timeout_seconds,
+            )
+            old_ids = dict(
+                zip(
+                    zip(old_discovery.urls, old_discovery.models),
+                    old_discovery.engines_id,
+                )
+            )
+            new_discovery.engines_id = [
+                old_ids.get((url, model), engine_id)
+                for url, model, engine_id in zip(
+                    new_discovery.urls, new_discovery.models, new_discovery.engines_id
+                )
+            ]
+            if config.static_backend_health_checks:
+                new_discovery.unhealthy_endpoint_hashes = list(
+                    old_discovery.unhealthy_endpoint_hashes
+                )
+                new_discovery.start_health_check_task()
+        router = self.app.state.router
+        if config.routing_logic != self.current_config.routing_logic:
+            router = (
+                LeastQueueRouter()
+                if config.routing_logic == "leastqueue"
+                else RoundRobinRouter()
+            )
+        self.app.state.engine_stats_scraper.update_interval(
+            config.engine_stats_interval
+        )
+        if isinstance(router, LeastQueueRouter):
+            with router._lock:
+                router.metrics_max_age = config.leastqueue_metrics_max_age
+                router.reservation_ttl = config.leastqueue_reservation_ttl
+        router.max_instance_failover_reroute_attempts = (
+            config.max_instance_failover_reroute_attempts
+        )
+        self.app.state.router = router
+        if new_discovery is not None:
+            swap_service_discovery(new_discovery)
+            threading.Thread(target=old_discovery.close, daemon=True).start()
+        self.current_config = config
+
+    async def _apply_on_event_loop(self, config):
+        self.reconfigure_all(config)
+        self.current_config = config
 
     def _sleep_or_break(self, check_interval: float = 1):
         """
@@ -295,7 +493,13 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                     logger.info(
                         "DynamicConfigWatcher: Config changed, reconfiguring..."
                     )
-                    self.reconfigure_all(config)
+                    loop = getattr(self.app.state, "event_loop", None)
+                    if loop is None or not loop.is_running():
+                        self._sleep_or_break()
+                        continue
+                    asyncio.run_coroutine_threadsafe(
+                        self._apply_on_event_loop(config), loop
+                    ).result()
                     logger.info("DynamicConfigWatcher: Config reconfiguration complete")
                     self.current_config = config
             except Exception as e:

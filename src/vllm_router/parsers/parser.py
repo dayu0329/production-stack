@@ -91,6 +91,10 @@ def validate_static_model_types(model_types: str | None) -> None:
 # --- Argument Parsing and Initialization ---
 def validate_args(args):
     verify_required_args_provided(args)
+    if args.dynamic_config_yaml or args.dynamic_config_json:
+        from vllm_router.dynamic_config import DynamicRouterConfig
+
+        DynamicRouterConfig.from_args(args).validate()
     if args.service_discovery == "static":
         if args.static_backends is None:
             raise ValueError(
@@ -238,6 +242,7 @@ def parse_args():
         type=str,
         choices=[
             "roundrobin",
+            "leastqueue",
             "session",
             "kvaware",
             "loadaware",
@@ -247,6 +252,18 @@ def parse_args():
             "priority",
         ],
         help="The routing logic to use",
+    )
+    parser.add_argument(
+        "--leastqueue-metrics-max-age",
+        type=float,
+        default=5.0,
+        help="Maximum age in seconds of backend metrics for leastqueue routing.",
+    )
+    parser.add_argument(
+        "--leastqueue-reservation-ttl",
+        type=float,
+        default=1.0,
+        help="Seconds to count each new assignment as pending; 0 disables compensation.",
     )
     parser.add_argument(
         "--lmcache-controller-port",

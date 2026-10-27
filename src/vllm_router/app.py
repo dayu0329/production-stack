@@ -126,6 +126,9 @@ async def lifespan(app: FastAPI):
         await app.state.external_provider_registry.validate_models()
 
     yield
+    dyn_cfg_watcher = get_dynamic_config_watcher()
+    if dyn_cfg_watcher is not None:
+        await asyncio.to_thread(dyn_cfg_watcher.close)
     await app.state.aiohttp_client_wrapper.stop()
 
     # Close the threaded-components
@@ -138,10 +141,6 @@ async def lifespan(app: FastAPI):
     service_discovery.close()
 
     # Close the optional dynamic config watcher
-    dyn_cfg_watcher = get_dynamic_config_watcher()
-    if dyn_cfg_watcher is not None:
-        logger.info("Closing dynamic config watcher")
-        dyn_cfg_watcher.close()
 
     # Close routing logic instances
     logger.info("Closing routing logic instances")
@@ -280,6 +279,8 @@ def initialize_all(app: FastAPI, args):
         decode_model_labels=args.decode_model_labels,
         kv_aware_threshold=args.kv_aware_threshold,
         loadaware_beta=args.loadaware_beta,
+        leastqueue_metrics_max_age=args.leastqueue_metrics_max_age,
+        leastqueue_reservation_ttl=args.leastqueue_reservation_ttl,
         prefix_min_match_length=args.prefix_min_match_length,
         priority_header=args.priority_header,
         priority_field=args.priority_field,

@@ -10,6 +10,7 @@ The source code for the request router.
 - Model aliases
 - Multiple different routing algorithms
   - Round-robin routing
+  - Least-queue routing
   - Session-ID based routing
   - (WIP) prefix-aware routing
 
@@ -35,8 +36,10 @@ The router can be configured using command-line arguments. Below are the availab
 
 ### Routing Logic Options
 
-- `--routing-logic`: The routing logic to use. Options are `roundrobin` or `session`. This option is required.
+- `--routing-logic`: The routing logic to use, including `roundrobin`, `leastqueue`, and `session`. This option is required.
 - `--session-key`: The key (in the header) to identify a session.
+- `--leastqueue-metrics-max-age`: Maximum age in seconds of backend request metrics for `leastqueue`. Default is `5`.
+- `--leastqueue-reservation-ttl`: Seconds to count a new assignment against the backend's running requests. Default is `1`; `0` disables it.
 
 ### Monitoring Options
 
@@ -119,7 +122,7 @@ Currently, the dynamic config supports the following fields:
 **Required fields:**
 
 - `service_discovery`: The service discovery type. Options are `static` or `k8s`.
-- `routing_logic`: The routing logic to use. Options are `roundrobin` or `session`.
+- `routing_logic`: The routing logic to use, including `roundrobin`, `leastqueue`, and `session`.
 
 **Optional fields:**
 
@@ -132,6 +135,11 @@ Currently, the dynamic config supports the following fields:
 - (When using `k8s` service discovery) `k8s_namespace`: The namespace of vLLM pods when using K8s service discovery. Default is `default`.
 - (When using `k8s` service discovery) `k8s_label_selector`: The label selector to filter vLLM pods when using K8s service discovery.
 - `session_key`: The key (in the header) to identify a session when using session-based routing.
+- `leastqueue_metrics_max_age` and `leastqueue_reservation_ttl`: Metrics freshness and short-lived assignment settings for `leastqueue`.
+- `engine_stats_interval`: Backend metrics scrape interval in seconds.
+- `max_instance_failover_reroute_attempts`: Number of backend failover attempts.
+
+Static `leastqueue` and `roundrobin` configurations can update backend URLs, model mappings, aliases, health-check settings, and the parameters above without restarting. They can also switch between these two strategies. Invalid updates retain the previous configuration. See the [root README](../../README.md#live-static-backend-updates) for a deployment example and limits.
 
 Here is an example of a dynamic YAML config file:
 

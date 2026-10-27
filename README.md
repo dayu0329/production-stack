@@ -1,5 +1,7 @@
 # vLLM Production Stack: reference stack for production vLLM deployment
 
+This fork adds `leastqueue` routing and live updates for static router backends. It is based on [vLLM Production Stack](https://github.com/vllm-project/production-stack); the features below require a router image built from this repository.
+
 | [**Blog**](https://lmcache.github.io) | [**Docs**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack Channel**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**Interest Form**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
 <p align="center">
@@ -122,10 +124,62 @@ The router ensures efficient request distribution among backends. It supports:
 - Model aliases
 - Multiple routing algorithms:
   - Round-robin routing
+  - Least-queue routing (`leastqueue`)
   - Session-ID based routing
   - Prefix-aware routing (WIP)
 
 Please refer to the [router documentation](./src/vllm_router/README.md) for more details.
+
+### Least-queue routing
+
+For the requested model, `leastqueue` selects a healthy backend using the lowest `(vllm:num_requests_waiting, vllm:num_requests_running + recent_assignments)` pair. Equal scores rotate by least recent selection. Each assignment counts locally for one second by default, so concurrent requests do not all select the same backend from an unchanged metrics snapshot. The adjustment applies to running requests only; a backend with fewer actual waiting requests still takes priority.
+
+The router scrapes backend `/metrics` endpoints directly, with up to 16 concurrent scrapes. Both request metrics must be present, valid, and have matching labels. Metrics from multiple data-parallel engines at one URL are summed. With the default five-second freshness limit, a backend without fresh metrics is excluded while any backend has fresh metrics. If none do, routing rotates among healthy backends; if none are healthy, the request receives 503. Static backend health checks can provide a separate health signal, but they send real test requests to the backends.
+
+Install this repository with Python 3.12 or later, then start the router with your own backend URLs and model names:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+vllm-router --port 8000 \
+  --service-discovery static \
+  --static-backends "http://vllm-1:8000,http://vllm-2:8000" \
+  --static-models "my-model,my-model" \
+  --static-model-types "chat,chat" \
+  --static-backend-health-checks \
+  --routing-logic leastqueue \
+  --engine-stats-interval 1 \
+  --leastqueue-metrics-max-age 5 \
+  --leastqueue-reservation-ttl 1 \
+  --max-instance-failover-reroute-attempts 1
+```
+
+The default scrape interval is 30 seconds, so set `--engine-stats-interval` below the metrics freshness limit for this strategy. Set `--leastqueue-reservation-ttl 0` to disable the local assignment adjustment. These reservations are per router process; multiple router replicas do not share them. Connection failures can reroute before a response starts, while HTTP error responses pass through and started streams are not replayed.
+
+For Helm deployments, build and push this repository's router image and set `routerSpec.routingLogic: leastqueue`, `routerSpec.engineScrapeInterval: 1`, and the two least-queue flags in `routerSpec.extraArgs`.
+
+### Live static backend updates
+
+Use `--dynamic-config-yaml` or `--dynamic-config-json` to watch a complete router configuration. Static `leastqueue` and `roundrobin` configurations support live changes to backend URLs, model mappings and aliases, health-check settings, the least-queue parameters, `engine_stats_interval`, and `max_instance_failover_reroute_attempts`. Backend and parameter updates under the same strategy preserve existing short-lived assignments. Switching between these two strategies is supported for static service discovery. Other changes may require a restart.
+
+An example YAML file is at [`examples/wy-router/router.yaml`](./examples/wy-router/router.yaml). Replace its backend URLs and model name for your deployment. On a Linux Docker host, mount the configuration directory so editors can replace the file atomically:
+
+```bash
+mkdir -p /opt/wy-router/config
+cp examples/wy-router/router.yaml /opt/wy-router/config/router.yaml
+docker build -f docker/Dockerfile -t wy-router:leastqueue .
+docker run -d --name wy-router --restart unless-stopped \
+  -p 4020:8080 \
+  -v /opt/wy-router/config:/app/config:ro \
+  wy-router:leastqueue \
+  --host 0.0.0.0 --port 8080 \
+  --dynamic-config-yaml /app/config/router.yaml
+```
+
+Edit `static_backends` to add or remove URLs; the watcher checks for changes about every ten seconds. New backends need a successful metrics scrape before they join metrics-based selection when another backend has fresh metrics. At least one backend must remain. Invalid or unsupported updates log a warning and leave the last successful configuration active. Check `docker logs --since 1m wy-router` and the `dynamic_config` field of `curl http://localhost:4020/health` to confirm an update. Removed backends receive no new requests, while in-flight requests and streams continue on their existing connections; wait for them to finish before stopping those vLLM instances.
+
+Run the focused tests with `python -m pytest src/tests/test_leastqueue_router.py src/tests/test_leastqueue_http.py src/tests/test_hot_reload.py -q`. They use simulated HTTP backends and do not replace throughput or latency testing with real vLLM instances.
 
 ## Contributing
 

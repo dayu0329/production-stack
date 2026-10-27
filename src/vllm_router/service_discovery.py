@@ -1463,6 +1463,11 @@ def get_service_discovery() -> ServiceDiscovery:
     return _global_service_discovery
 
 
+def swap_service_discovery(discovery: ServiceDiscovery):
+    global _global_service_discovery
+    _global_service_discovery = discovery
+
+
 if __name__ == "__main__":
     # Test the service discovery
     # k8s_sd = K8sServiceDiscovery("default", 8000, "release=test")

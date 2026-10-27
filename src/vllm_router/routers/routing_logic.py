@@ -22,6 +22,7 @@ import random
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -54,6 +55,7 @@ logger = init_logger(__name__)
 
 class RoutingLogic(str, enum.Enum):
     ROUND_ROBIN = "roundrobin"
+    LEAST_QUEUE = "leastqueue"
     SESSION_BASED = "session"
     KVAWARE = "kvaware"
     LOADAWARE = "loadaware"
@@ -226,6 +228,92 @@ class RoundRobinRouter(RoutingInterface):
             self._next_index.clear()
         self._next_index[endpoint_urls] = idx + 1
         return endpoint_urls[idx % len(endpoint_urls)]
+
+
+class LeastQueueRouter(RoutingInterface):
+    def __init__(self, metrics_max_age: float = 5.0, reservation_ttl: float = 1.0):
+        if hasattr(self, "_initialized"):
+            return
+        if not math.isfinite(metrics_max_age) or metrics_max_age <= 0:
+            raise ValueError("leastqueue metrics max age must be positive and finite")
+        if not math.isfinite(reservation_ttl) or reservation_ttl < 0:
+            raise ValueError(
+                "leastqueue reservation TTL must be nonnegative and finite"
+            )
+        self.metrics_max_age = metrics_max_age
+        self.reservation_ttl = reservation_ttl
+        self._reservations = {}
+        self._last_selected = {}
+        self._sequence = 0
+        self._lock = threading.Lock()
+        self._last_fallback_log = float("-inf")
+        self._initialized = True
+
+    def route_request(self, endpoints, engine_stats, request_stats, request) -> str:
+        candidates = {
+            endpoint.url: endpoint
+            for endpoint in endpoints
+            if getattr(endpoint, "healthy", True)
+            and not getattr(endpoint, "sleep", False)
+        }
+        if not candidates:
+            raise HTTPException(status_code=503, detail="No healthy backend available")
+        with self._lock:
+            now = time.monotonic()
+            for url in list(self._reservations):
+                reservations = self._reservations[url]
+                while reservations and reservations[0] <= now:
+                    reservations.popleft()
+                if not reservations:
+                    del self._reservations[url]
+            fresh = {
+                url: engine_stats[url]
+                for url in candidates
+                if url in engine_stats
+                and engine_stats[url].request_metrics_valid
+                and 0 <= now - engine_stats[url].observed_at <= self.metrics_max_age
+            }
+            if fresh:
+                scores = {
+                    url: (
+                        stats.num_queuing_requests,
+                        stats.num_running_requests
+                        + len(self._reservations.get(url, ())),
+                    )
+                    for url, stats in fresh.items()
+                }
+                best_score = min(scores.values())
+                eligible = [url for url, score in scores.items() if score == best_score]
+            else:
+                eligible = list(candidates)
+                if now - self._last_fallback_log >= 30:
+                    logger.warning(
+                        "leastqueue: no fresh request metrics; rotating healthy backends"
+                    )
+                    self._last_fallback_log = now
+            selected = min(
+                eligible, key=lambda url: (self._last_selected.get(url, -1), url)
+            )
+            if selected not in self._last_selected and len(self._last_selected) >= 4096:
+                self._last_selected = {
+                    url: sequence
+                    for url, sequence in self._last_selected.items()
+                    if url in candidates
+                }
+            self._last_selected[selected] = self._sequence
+            self._sequence += 1
+            if self.reservation_ttl > 0:
+                self._reservations.setdefault(selected, deque()).append(
+                    now + self.reservation_ttl
+                )
+            logger.debug(
+                "leastqueue selected %s: metrics=%s reservations=%s fallback=%s",
+                selected,
+                fresh.get(selected),
+                len(self._reservations.get(selected, ())),
+                not fresh,
+            )
+            return selected
 
 
 class SessionRouter(RoutingInterface):
@@ -1223,6 +1311,11 @@ def initialize_routing_logic(
     if routing_logic == RoutingLogic.ROUND_ROBIN:
         logger.info("Initializing round-robin routing logic")
         router = RoundRobinRouter()
+    elif routing_logic == RoutingLogic.LEAST_QUEUE:
+        router = LeastQueueRouter(
+            metrics_max_age=kwargs.get("leastqueue_metrics_max_age", 5.0),
+            reservation_ttl=kwargs.get("leastqueue_reservation_ttl", 1.0),
+        )
     elif routing_logic == RoutingLogic.SESSION_BASED:
         logger.info(f"Initializing session-based routing logic with kwargs: {kwargs}")
         router = SessionRouter(kwargs.get("session_key"))
@@ -1300,6 +1393,7 @@ def get_routing_logic() -> RoutingInterface:
     for cls in (
         SessionRouter,
         RoundRobinRouter,
+        LeastQueueRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,
@@ -1317,6 +1411,7 @@ def cleanup_routing_logic():
     for cls in (
         SessionRouter,
         RoundRobinRouter,
+        LeastQueueRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,

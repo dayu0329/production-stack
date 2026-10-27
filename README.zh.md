@@ -1,5 +1,7 @@
 # vLLM Production Stack：面向生产环境的 vLLM 部署参考栈
 
+本 Fork 基于 [vLLM Production Stack](https://github.com/vllm-project/production-stack)，新增 `leastqueue` 选路和静态后端热更新。使用这些功能时，需要从本仓库构建 Router 镜像。
+
 | [**博客**](https://lmcache.github.io) | [**官方文档**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack 频道**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**意向登记表**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
 <p align="center">
@@ -122,10 +124,60 @@ Grafana 监控面板提供以下核心维度的可观测性洞察：
 - 模型别名（Model Aliases）映射
 - 多种路由算法：
   - 轮询路由（Round-robin routing）
+  - 最短队列路由（`leastqueue`）
   - 基于会话 ID 路由（Session-ID based routing）
   - 前缀感知路由（Prefix-aware routing，开发中）
 
 更多详细信息请参阅[路由器专项文档](./src/vllm_router/README.md)。
+
+### 最短队列选路
+
+`leastqueue` 先筛选请求模型的健康实例，再按 `(vllm:num_requests_waiting, vllm:num_requests_running + 短时分配数)` 升序选择。分数相同时选择最久未被选中的实例。每次分配会在本 Router 进程内保留默认一秒的记录，以补偿指标快照尚未反映的新请求；记录只补偿 Running，不会制造 Waiting。设置 `--leastqueue-reservation-ttl 0` 可关闭补偿。多个 Router 副本之间不共享这些记录。
+
+Router 直接并发抓取各后端 `/metrics`，最多 16 路，无需单独的 Prometheus 服务。Running 和 Waiting 指标必须同时存在、标签匹配且为非负整数；同一 URL 下多个 DP engine 的指标会汇总。默认只使用五秒内的有效指标；若所有指标缺失或过期，则在健康实例间轮转，若没有健康实例则返回 503。静态健康检查会向后端发送真实测试请求。
+
+使用 Python 3.12 或以上安装本仓库源码，然后替换示例中的后端地址和模型名：
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+vllm-router --port 8000 \
+  --service-discovery static \
+  --static-backends "http://vllm-1:8000,http://vllm-2:8000" \
+  --static-models "my-model,my-model" \
+  --static-model-types "chat,chat" \
+  --static-backend-health-checks \
+  --routing-logic leastqueue \
+  --engine-stats-interval 1 \
+  --leastqueue-metrics-max-age 5 \
+  --leastqueue-reservation-ttl 1 \
+  --max-instance-failover-reroute-attempts 1
+```
+
+默认指标抓取间隔为 30 秒，使用此策略时应将 `--engine-stats-interval` 设为小于指标最大年龄。连接失败可在收到响应前切换后端；HTTP 错误响应直接返回，已开始的流不会重放。Helm 部署时请使用本仓库构建的镜像，并设置 `routerSpec.routingLogic: leastqueue`、`routerSpec.engineScrapeInterval: 1`，通过 `routerSpec.extraArgs` 传入两个 leastqueue 参数。
+
+### 静态后端热更新
+
+通过 `--dynamic-config-yaml` 或 `--dynamic-config-json` 监视完整配置。静态 `leastqueue` 和 `roundrobin` 支持热更新后端列表、模型映射与别名、健康检查、leastqueue 参数、`engine_stats_interval` 和 `max_instance_failover_reroute_attempts`，也支持在这两种策略之间切换。同一策略下更新后端或参数时会保留已有的短时分配记录。其他字段可能需要重启。
+
+示例配置位于 [`examples/wy-router/router.yaml`](./examples/wy-router/router.yaml)，部署前请替换其中的后端地址和模型名。在 Linux Docker 主机上挂载整个配置目录，以支持编辑器替换文件：
+
+```bash
+mkdir -p /opt/wy-router/config
+cp examples/wy-router/router.yaml /opt/wy-router/config/router.yaml
+docker build -f docker/Dockerfile -t wy-router:leastqueue .
+docker run -d --name wy-router --restart unless-stopped \
+  -p 4020:8080 \
+  -v /opt/wy-router/config:/app/config:ro \
+  wy-router:leastqueue \
+  --host 0.0.0.0 --port 8080 \
+  --dynamic-config-yaml /app/config/router.yaml
+```
+
+编辑 `static_backends` 增删 URL，监视器约每十秒检查一次。至少保留一个后端。已有后端指标有效时，新后端须等到首次成功抓取指标后才参与指标选路。无效配置会记录警告并继续使用上一份成功配置。可用 `docker logs --since 1m wy-router` 及 `curl http://localhost:4020/health` 中的 `dynamic_config` 核对结果。被移除的后端不会再接收新请求；已经分配的请求和 SSE 继续使用原连接，关闭该 vLLM 实例前应等待这些请求结束。
+
+相关测试：`python -m pytest src/tests/test_leastqueue_router.py src/tests/test_leastqueue_http.py src/tests/test_hot_reload.py -q`。测试使用模拟 HTTP 后端，不能代替真实 vLLM 吞吐和延迟压测。
 
 ## 参与贡献
 
