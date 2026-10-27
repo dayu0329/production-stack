@@ -35,6 +35,7 @@ async def backend(name, waiting, running, model="test"):
             text=(
                 f'vllm:num_requests_running{{model_name="{model}"}} {state["running"]}\n'
                 f'vllm:num_requests_waiting{{model_name="{model}"}} {state["waiting"]}\n'
+                f'vllm:kv_cache_usage_perc{{model_name="{model}"}} 0.5\n'
             )
         )
 
@@ -78,8 +79,10 @@ async def backend(name, waiting, running, model="test"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["leastqueue", "leastkvperrequest"])
 async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
     monkeypatch,
+    policy,
 ):
     cleanup_routing_logic()
     SingletonMeta._instances.pop(RequestStatsMonitor, None)
@@ -122,7 +125,7 @@ async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
         app = FastAPI()
         app.include_router(main_router)
         app.state.router = initialize_routing_logic(
-            "leastqueue",
+            policy,
             leastqueue_reservation_ttl=0,
             max_instance_failover_reroute_attempts=1,
         )
@@ -184,8 +187,10 @@ async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["leastqueue", "leastkvperrequest"])
 async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list(
     monkeypatch,
+    policy,
 ):
     cleanup_routing_logic()
     SingletonMeta._instances.pop(RequestStatsMonitor, None)
@@ -196,7 +201,7 @@ async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list
         app.include_router(main_router)
         config = DynamicRouterConfig(
             service_discovery="static",
-            routing_logic="leastqueue",
+            routing_logic=policy,
             static_backends=f'{first["url"]},{second["url"]}',
             static_models="test,test",
             engine_stats_interval=1,
@@ -214,7 +219,7 @@ async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list
         scraper.engine_stats_lock = threading.Lock()
         scraper.engine_stats = {}
         await asyncio.to_thread(scraper._scrape_metrics)
-        app.state.router = initialize_routing_logic("leastqueue")
+        app.state.router = initialize_routing_logic(policy)
         app.state.engine_stats_scraper = scraper
         app.state.request_stats_monitor = RequestStatsMonitor(sliding_window_size=60)
         app.state.aiohttp_client_wrapper = AiohttpClientWrapper()

@@ -28,6 +28,7 @@ from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
 from vllm_router.routers.routing_logic import (
+    LeastKVPerRequestRouter,
     LeastQueueRouter,
     RoundRobinRouter,
     reconfigure_routing_logic,
@@ -364,7 +365,8 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         config.validate()
         if (
             self.current_config.service_discovery == "static"
-            and self.current_config.routing_logic in ("leastqueue", "roundrobin")
+            and self.current_config.routing_logic
+            in ("leastqueue", "leastkvperrequest", "roundrobin")
         ):
             return self._reconfigure_static(config)
         self.reconfigure_service_discovery(config)
@@ -376,10 +378,11 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
     def _reconfigure_static(self, config):
         if config.service_discovery != "static" or config.routing_logic not in (
             "leastqueue",
+            "leastkvperrequest",
             "roundrobin",
         ):
             raise ValueError(
-                "Live static updates support leastqueue and roundrobin only"
+                "Live static updates support leastqueue, leastkvperrequest and roundrobin only"
             )
         supported = {
             "static_backends",
@@ -440,18 +443,22 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                 new_discovery.start_health_check_task()
         router = self.app.state.router
         if config.routing_logic != self.current_config.routing_logic:
-            router = (
-                LeastQueueRouter()
-                if config.routing_logic == "leastqueue"
-                else RoundRobinRouter()
-            )
+            router = {
+                "leastqueue": LeastQueueRouter,
+                "leastkvperrequest": LeastKVPerRequestRouter,
+                "roundrobin": RoundRobinRouter,
+            }[config.routing_logic]()
         self.app.state.engine_stats_scraper.update_interval(
             config.engine_stats_interval
         )
         if isinstance(router, LeastQueueRouter):
             with router._lock:
                 router.metrics_max_age = config.leastqueue_metrics_max_age
-                router.reservation_ttl = config.leastqueue_reservation_ttl
+                router.reservation_ttl = (
+                    0
+                    if isinstance(router, LeastKVPerRequestRouter)
+                    else config.leastqueue_reservation_ttl
+                )
         router.max_instance_failover_reroute_attempts = (
             config.max_instance_failover_reroute_attempts
         )

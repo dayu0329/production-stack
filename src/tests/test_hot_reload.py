@@ -10,6 +10,7 @@ from fastapi import FastAPI
 import vllm_router.service_discovery as discovery_module
 from vllm_router.dynamic_config import DynamicConfigWatcher, DynamicRouterConfig
 from vllm_router.routers.routing_logic import (
+    LeastKVPerRequestRouter,
     cleanup_routing_logic,
     initialize_routing_logic,
 )
@@ -156,6 +157,33 @@ def test_user_example_parses():
     config.validate()
     assert len(config.static_backends.split(",")) == 4
     assert config.static_models == ",".join(["my-model"] * 4)
+
+
+def test_switch_to_kv_mode_update_backends_and_switch_back(setup_reload):
+    app, config, watcher = setup_reload
+    config = replace(config, routing_logic="leastkvperrequest")
+    watcher.reconfigure_all(config)
+    router = app.state.router
+    assert isinstance(router, LeastKVPerRequestRouter)
+    assert router.reservation_ttl == 0
+    config = replace(
+        config,
+        static_backends="http://third:8000",
+        static_models="test",
+        leastqueue_metrics_max_age=8,
+        leastqueue_reservation_ttl=3,
+    )
+    watcher.reconfigure_all(config)
+    assert app.state.router is router
+    assert router.metrics_max_age == 8
+    assert router.reservation_ttl == 0
+    assert get_service_discovery().urls == ["http://third:8000"]
+    config = replace(config, routing_logic="roundrobin")
+    watcher.reconfigure_all(config)
+    config = replace(config, routing_logic="leastqueue")
+    watcher.reconfigure_all(config)
+    assert not isinstance(app.state.router, LeastKVPerRequestRouter)
+    assert app.state.router.reservation_ttl == 3
 
 
 def test_startup_loads_yaml_with_scrape_and_retry_settings(monkeypatch, tmp_path):

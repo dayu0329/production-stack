@@ -243,6 +243,7 @@ def parse_args():
         choices=[
             "roundrobin",
             "leastqueue",
+            "leastkvperrequest",
             "session",
             "kvaware",
             "loadaware",
@@ -257,7 +258,7 @@ def parse_args():
         "--leastqueue-metrics-max-age",
         type=float,
         default=5.0,
-        help="Maximum age in seconds of backend metrics for leastqueue routing.",
+        help="Maximum age in seconds of backend metrics for leastqueue and leastkvperrequest routing.",
     )
     parser.add_argument(
         "--leastqueue-reservation-ttl",

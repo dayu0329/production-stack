@@ -1,6 +1,6 @@
 # vLLM Production Stack: reference stack for production vLLM deployment
 
-This fork adds `leastqueue` routing and live updates for static router backends. It is based on [vLLM Production Stack](https://github.com/vllm-project/production-stack); the features below require a router image built from this repository.
+This fork adds `leastqueue` and `leastkvperrequest` routing and live updates for static router backends. It is based on [vLLM Production Stack](https://github.com/vllm-project/production-stack); the features below require a router image built from this repository.
 
 | [**Blog**](https://lmcache.github.io) | [**Docs**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack Channel**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**Interest Form**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
@@ -125,6 +125,7 @@ The router ensures efficient request distribution among backends. It supports:
 - Multiple routing algorithms:
   - Round-robin routing
   - Least-queue routing (`leastqueue`)
+  - Least KV usage per running request (`leastkvperrequest`)
   - Session-ID based routing
   - Prefix-aware routing (WIP)
 
@@ -158,6 +159,16 @@ vllm-router --port 8000 \
 The default scrape interval is 30 seconds, so set `--engine-stats-interval` below the metrics freshness limit for this strategy. Set `--leastqueue-reservation-ttl 0` to disable the local assignment adjustment. These reservations are per router process; multiple router replicas do not share them. Connection failures can reroute before a response starts, while HTTP error responses pass through and started streams are not replayed.
 
 For Helm deployments, build and push this repository's router image and set `routerSpec.routingLogic: leastqueue`, `routerSpec.engineScrapeInterval: 1`, and the two least-queue flags in `routerSpec.extraArgs`.
+
+### Least KV usage per running request
+
+Set `--routing-logic leastkvperrequest` to sort by `(Waiting, GPU KV cache usage / Running)`, with a ratio of **0 when Running is 0**. Waiting always takes priority; equal scores rotate by least recent selection. This mode uses measured Running only and does not apply short-lived assignment compensation. It can favor a busier backend when that backend has a smaller ratio, and an idle backend scores zero even with high KV usage. No KV high-water threshold overrides this ordering.
+
+Use `--engine-stats-interval 1` and `--leastqueue-metrics-max-age 5` as in the least-queue example. The reservation TTL option applies only to `leastqueue`. Both `vllm:kv_cache_usage_perc` and the older `vllm:gpu_cache_usage_perc` are supported, with the newer metric preferred when both exist. Values must be finite fractions between 0 and 1 with labels matching the request metrics. For multiple engines at one URL, KV usage is the arithmetic mean of engine fractions and Running is their sum; equal cache capacities are assumed for this mean.
+
+Running greater than zero requires valid KV metrics. Running equal to zero needs only valid request metrics. Backends without fresh usable metrics are excluded while another backend has usable metrics; otherwise, healthy backends rotate. Static configurations can hot-switch between `leastkvperrequest`, `leastqueue`, and `roundrobin`. In YAML, set `routing_logic: leastkvperrequest`; in Helm, set `routerSpec.routingLogic: leastkvperrequest`.
+
+Run `python -m pytest src/tests/test_leastkvperrequest_router.py src/tests/test_hot_reload.py -q` to check the ratio policy and hot updates.
 
 ### Live static backend updates
 

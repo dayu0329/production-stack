@@ -56,6 +56,7 @@ logger = init_logger(__name__)
 class RoutingLogic(str, enum.Enum):
     ROUND_ROBIN = "roundrobin"
     LEAST_QUEUE = "leastqueue"
+    LEAST_KV_PER_REQUEST = "leastkvperrequest"
     SESSION_BASED = "session"
     KVAWARE = "kvaware"
     LOADAWARE = "loadaware"
@@ -249,6 +250,15 @@ class LeastQueueRouter(RoutingInterface):
         self._last_fallback_log = float("-inf")
         self._initialized = True
 
+    def _metrics_valid(self, stats):
+        return stats.request_metrics_valid
+
+    def _score(self, url, stats):
+        return (
+            stats.num_queuing_requests,
+            stats.num_running_requests + len(self._reservations.get(url, ())),
+        )
+
     def route_request(self, endpoints, engine_stats, request_stats, request) -> str:
         candidates = {
             endpoint.url: endpoint
@@ -270,25 +280,19 @@ class LeastQueueRouter(RoutingInterface):
                 url: engine_stats[url]
                 for url in candidates
                 if url in engine_stats
-                and engine_stats[url].request_metrics_valid
+                and self._metrics_valid(engine_stats[url])
                 and 0 <= now - engine_stats[url].observed_at <= self.metrics_max_age
             }
             if fresh:
-                scores = {
-                    url: (
-                        stats.num_queuing_requests,
-                        stats.num_running_requests
-                        + len(self._reservations.get(url, ())),
-                    )
-                    for url, stats in fresh.items()
-                }
+                scores = {url: self._score(url, stats) for url, stats in fresh.items()}
                 best_score = min(scores.values())
                 eligible = [url for url, score in scores.items() if score == best_score]
             else:
                 eligible = list(candidates)
                 if now - self._last_fallback_log >= 30:
                     logger.warning(
-                        "leastqueue: no fresh request metrics; rotating healthy backends"
+                        "%s: no fresh valid metrics; rotating healthy backends",
+                        type(self).__name__,
                     )
                     self._last_fallback_log = now
             selected = min(
@@ -307,13 +311,32 @@ class LeastQueueRouter(RoutingInterface):
                     now + self.reservation_ttl
                 )
             logger.debug(
-                "leastqueue selected %s: metrics=%s reservations=%s fallback=%s",
+                "%s selected %s: metrics=%s reservations=%s fallback=%s",
+                type(self).__name__,
                 selected,
                 fresh.get(selected),
                 len(self._reservations.get(selected, ())),
                 not fresh,
             )
             return selected
+
+
+class LeastKVPerRequestRouter(LeastQueueRouter):
+    def __init__(self, metrics_max_age: float = 5.0):
+        super().__init__(metrics_max_age=metrics_max_age, reservation_ttl=0)
+
+    def _metrics_valid(self, stats):
+        return stats.request_metrics_valid and (
+            stats.num_running_requests == 0 or stats.kv_cache_usage_ratio is not None
+        )
+
+    def _score(self, url, stats):
+        ratio = (
+            stats.kv_cache_usage_ratio / stats.num_running_requests
+            if stats.num_running_requests > 0
+            else 0.0
+        )
+        return stats.num_queuing_requests, ratio
 
 
 class SessionRouter(RoutingInterface):
@@ -1316,6 +1339,10 @@ def initialize_routing_logic(
             metrics_max_age=kwargs.get("leastqueue_metrics_max_age", 5.0),
             reservation_ttl=kwargs.get("leastqueue_reservation_ttl", 1.0),
         )
+    elif routing_logic == RoutingLogic.LEAST_KV_PER_REQUEST:
+        router = LeastKVPerRequestRouter(
+            metrics_max_age=kwargs.get("leastqueue_metrics_max_age", 5.0),
+        )
     elif routing_logic == RoutingLogic.SESSION_BASED:
         logger.info(f"Initializing session-based routing logic with kwargs: {kwargs}")
         router = SessionRouter(kwargs.get("session_key"))
@@ -1394,6 +1421,7 @@ def get_routing_logic() -> RoutingInterface:
         SessionRouter,
         RoundRobinRouter,
         LeastQueueRouter,
+        LeastKVPerRequestRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,
@@ -1412,6 +1440,7 @@ def cleanup_routing_logic():
         SessionRouter,
         RoundRobinRouter,
         LeastQueueRouter,
+        LeastKVPerRequestRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,

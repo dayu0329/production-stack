@@ -11,6 +11,7 @@ The source code for the request router.
 - Multiple different routing algorithms
   - Round-robin routing
   - Least-queue routing
+  - Least KV usage per running request (`leastkvperrequest`)
   - Session-ID based routing
   - (WIP) prefix-aware routing
 
@@ -36,9 +37,9 @@ The router can be configured using command-line arguments. Below are the availab
 
 ### Routing Logic Options
 
-- `--routing-logic`: The routing logic to use, including `roundrobin`, `leastqueue`, and `session`. This option is required.
+- `--routing-logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, and `session`. This option is required.
 - `--session-key`: The key (in the header) to identify a session.
-- `--leastqueue-metrics-max-age`: Maximum age in seconds of backend request metrics for `leastqueue`. Default is `5`.
+- `--leastqueue-metrics-max-age`: Maximum age in seconds of backend metrics for `leastqueue` and `leastkvperrequest`. Default is `5`.
 - `--leastqueue-reservation-ttl`: Seconds to count a new assignment against the backend's running requests. Default is `1`; `0` disables it.
 
 ### Monitoring Options
@@ -122,7 +123,7 @@ Currently, the dynamic config supports the following fields:
 **Required fields:**
 
 - `service_discovery`: The service discovery type. Options are `static` or `k8s`.
-- `routing_logic`: The routing logic to use, including `roundrobin`, `leastqueue`, and `session`.
+- `routing_logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, and `session`.
 
 **Optional fields:**
 
@@ -140,6 +141,8 @@ Currently, the dynamic config supports the following fields:
 - `max_instance_failover_reroute_attempts`: Number of backend failover attempts.
 
 Static `leastqueue` and `roundrobin` configurations can update backend URLs, model mappings, aliases, health-check settings, and the parameters above without restarting. They can also switch between these two strategies. Invalid updates retain the previous configuration. See the [root README](../../README.md#live-static-backend-updates) for a deployment example and limits.
+
+The `leastkvperrequest` strategy sorts by Waiting first, then KV cache usage divided by measured Running, assigning zero when Running is zero. Ties rotate without assignment compensation. Static hot updates also support this strategy. See [policy details](../../README.md#least-kv-usage-per-running-request) for metric validation and fallback rules.
 
 Here is an example of a dynamic YAML config file:
 

@@ -1,6 +1,6 @@
 # vLLM Production Stack：面向生产环境的 vLLM 部署参考栈
 
-本 Fork 基于 [vLLM Production Stack](https://github.com/vllm-project/production-stack)，新增 `leastqueue` 选路和静态后端热更新。使用这些功能时，需要从本仓库构建 Router 镜像。
+本 Fork 基于 [vLLM Production Stack](https://github.com/vllm-project/production-stack)，新增 `leastqueue`、`leastkvperrequest` 选路和静态后端热更新。使用这些功能时，需要从本仓库构建 Router 镜像。
 
 | [**博客**](https://lmcache.github.io) | [**官方文档**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack 频道**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**意向登记表**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
@@ -125,6 +125,7 @@ Grafana 监控面板提供以下核心维度的可观测性洞察：
 - 多种路由算法：
   - 轮询路由（Round-robin routing）
   - 最短队列路由（`leastqueue`）
+  - 单个运行请求 KV 占用优先路由（`leastkvperrequest`）
   - 基于会话 ID 路由（Session-ID based routing）
   - 前缀感知路由（Prefix-aware routing，开发中）
 
@@ -156,6 +157,16 @@ vllm-router --port 8000 \
 ```
 
 默认指标抓取间隔为 30 秒，使用此策略时应将 `--engine-stats-interval` 设为小于指标最大年龄。连接失败可在收到响应前切换后端；HTTP 错误响应直接返回，已开始的流不会重放。Helm 部署时请使用本仓库构建的镜像，并设置 `routerSpec.routingLogic: leastqueue`、`routerSpec.engineScrapeInterval: 1`，通过 `routerSpec.extraArgs` 传入两个 leastqueue 参数。
+
+### 单个运行请求 KV 占用优先
+
+使用 `--routing-logic leastkvperrequest` 时，按 `(Waiting, GPU KV cache usage / Running)` 升序选路，**Running=0 时比值固定为 0**。Waiting 始终优先，分数相同则选择最久未被选中的实例。此模式只使用实际 Running，不使用短时分配补偿；高并发实例可能因比值更低而优先，空闲实例即使 KV 占用较高也得 0 分。不会额外使用 KV 高水位阈值改变该顺序。
+
+沿用 `--engine-stats-interval 1` 和 `--leastqueue-metrics-max-age 5`；短时记录 TTL 只对 `leastqueue` 生效。同时支持 `vllm:kv_cache_usage_perc` 和旧版 `vllm:gpu_cache_usage_perc`，两者均存在时优先使用新版。指标必须是 0 到 1 之间的有限比例值，标签需与请求指标匹配。同一 URL 下有多个 engine 时，KV 占用取各 engine 比例的算术平均值，Running 求和；平均值假设各 engine 缓存容量相同。
+
+Running 大于 0 时需要有效 KV 指标；Running 等于 0 时只需有效请求指标。有其他有效实例时排除指标缺失或过期的实例，所有实例指标不可用时在健康后端间轮转。静态模式支持在 `leastkvperrequest`、`leastqueue` 和 `roundrobin` 之间热切换。YAML 设置 `routing_logic: leastkvperrequest`，Helm 设置 `routerSpec.routingLogic: leastkvperrequest`。
+
+相关测试：`python -m pytest src/tests/test_leastkvperrequest_router.py src/tests/test_hot_reload.py -q`。
 
 ### 静态后端热更新
 

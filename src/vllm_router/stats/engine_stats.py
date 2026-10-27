@@ -42,6 +42,7 @@ class EngineStats:
     gpu_cache_usage_perc: float = 0.0
     observed_at: float = 0.0
     request_metrics_valid: bool = False
+    kv_cache_usage_ratio: float | None = None
 
     @staticmethod
     def from_vllm_scrape(vllm_scrape: str):
@@ -64,6 +65,8 @@ class EngineStats:
         gpu_prefix_cache_hits_total = 0
         gpu_prefix_cache_queries_total = 0
         gpu_cache_usage_perc = 0.0
+        cache_by_name = {}
+        invalid_cache_names = set()
 
         for family in text_string_to_metric_families(vllm_scrape):
             for sample in family.samples:
@@ -84,6 +87,15 @@ class EngineStats:
                     # vLLM renamed gpu_cache_usage_perc to kv_cache_usage_perc;
                     # newer releases only export the new name.
                     gpu_cache_usage_perc = sample.value
+                    cache_samples = cache_by_name.setdefault(sample.name, {})
+                    labels = tuple(sorted(sample.labels.items()))
+                    if (
+                        not math.isfinite(sample.value)
+                        or not 0 <= sample.value <= 1
+                        or labels in cache_samples
+                    ):
+                        invalid_cache_names.add(sample.name)
+                    cache_samples[labels] = sample.value
 
                 if sample.name in (
                     "vllm:num_requests_running",
@@ -100,7 +112,23 @@ class EngineStats:
                     else:
                         counts[labels] = int(sample.value)
 
+        cache_name = (
+            "vllm:kv_cache_usage_perc"
+            if "vllm:kv_cache_usage_perc" in cache_by_name
+            else "vllm:gpu_cache_usage_perc"
+        )
+        cache_samples = cache_by_name.get(cache_name, {})
+        cache_valid = (
+            bool(cache_samples)
+            and cache_name not in invalid_cache_names
+            and cache_samples.keys() == running_by_labels.keys()
+        )
         return EngineStats(
+            kv_cache_usage_ratio=(
+                sum(cache_samples.values()) / len(cache_samples)
+                if cache_valid
+                else None
+            ),
             observed_at=time.monotonic(),
             request_metrics_valid=(
                 bool(running_by_labels)
