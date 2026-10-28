@@ -79,7 +79,9 @@ async def backend(name, waiting, running, model="test"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["leastqueue", "leastkvperrequest"])
+@pytest.mark.parametrize(
+    "policy", ["leastqueue", "leastkvperrequest", "leastnormalizedload"]
+)
 async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
     monkeypatch,
     policy,
@@ -126,6 +128,11 @@ async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
         app.include_router(main_router)
         app.state.router = initialize_routing_logic(
             policy,
+            backend_running_targets={
+                first["url"]: 100,
+                second["url"]: 30,
+                other["url"]: 10,
+            },
             leastqueue_reservation_ttl=0,
             max_instance_failover_reroute_attempts=1,
         )
@@ -187,7 +194,9 @@ async def test_metrics_to_http_selection_streaming_model_filter_and_failover(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy", ["leastqueue", "leastkvperrequest"])
+@pytest.mark.parametrize(
+    "policy", ["leastqueue", "leastkvperrequest", "leastnormalizedload"]
+)
 async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list(
     monkeypatch,
     policy,
@@ -202,6 +211,7 @@ async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list
         config = DynamicRouterConfig(
             service_discovery="static",
             routing_logic=policy,
+            backend_running_targets={first["url"]: 100, second["url"]: 30},
             static_backends=f'{first["url"]},{second["url"]}',
             static_models="test,test",
             engine_stats_interval=1,
@@ -219,7 +229,9 @@ async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list
         scraper.engine_stats_lock = threading.Lock()
         scraper.engine_stats = {}
         await asyncio.to_thread(scraper._scrape_metrics)
-        app.state.router = initialize_routing_logic(policy)
+        app.state.router = initialize_routing_logic(
+            policy, backend_running_targets=config.backend_running_targets
+        )
         app.state.engine_stats_scraper = scraper
         app.state.request_stats_monitor = RequestStatsMonitor(sliding_window_size=60)
         app.state.aiohttp_client_wrapper = AiohttpClientWrapper()
@@ -244,7 +256,12 @@ async def test_remove_backend_preserves_active_sse_and_new_requests_use_new_list
                 )
                 await asyncio.wait_for(first["stream_started"].wait(), timeout=5)
                 watcher.reconfigure_all(
-                    replace(config, static_backends=second["url"], static_models="test")
+                    replace(
+                        config,
+                        static_backends=second["url"],
+                        static_models="test",
+                        backend_running_targets={second["url"]: 30},
+                    )
                 )
                 response = await client.post("/v1/chat/completions", json=payload)
                 assert response.status_code == 200

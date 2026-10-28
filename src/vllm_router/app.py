@@ -281,6 +281,7 @@ def initialize_all(app: FastAPI, args):
         loadaware_beta=args.loadaware_beta,
         leastqueue_metrics_max_age=args.leastqueue_metrics_max_age,
         leastqueue_reservation_ttl=args.leastqueue_reservation_ttl,
+        backend_running_targets=args.backend_running_targets,
         prefix_min_match_length=args.prefix_min_match_length,
         priority_header=args.priority_header,
         priority_field=args.priority_field,

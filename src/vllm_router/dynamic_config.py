@@ -29,6 +29,7 @@ from vllm_router.parsers.yaml_utils import (
 )
 from vllm_router.routers.routing_logic import (
     LeastKVPerRequestRouter,
+    LeastNormalizedLoadRouter,
     LeastQueueRouter,
     RoundRobinRouter,
     reconfigure_routing_logic,
@@ -82,6 +83,7 @@ class DynamicRouterConfig:
     session_key: Optional[str] = None
     leastqueue_metrics_max_age: float = 5.0
     leastqueue_reservation_ttl: float = 1.0
+    backend_running_targets: Optional[dict[str, int]] = None
     engine_stats_interval: float = 30.0
     max_instance_failover_reroute_attempts: int = 0
     priority_header: Optional[str] = "x-request-priority"
@@ -129,6 +131,7 @@ class DynamicRouterConfig:
             session_key=args.session_key,
             leastqueue_metrics_max_age=getattr(args, "leastqueue_metrics_max_age", 5.0),
             leastqueue_reservation_ttl=getattr(args, "leastqueue_reservation_ttl", 1.0),
+            backend_running_targets=getattr(args, "backend_running_targets", None),
             engine_stats_interval=args.engine_stats_interval,
             max_instance_failover_reroute_attempts=args.max_instance_failover_reroute_attempts,
             priority_header=args.priority_header,
@@ -154,6 +157,20 @@ class DynamicRouterConfig:
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True, indent=4)
 
     def validate(self):
+        if self.backend_running_targets is not None:
+            LeastNormalizedLoadRouter.validate_targets(self.backend_running_targets)
+        if self.routing_logic == "leastnormalizedload":
+            if self.service_discovery != "static":
+                raise ValueError(
+                    "leastnormalizedload requires static service discovery"
+                )
+            LeastNormalizedLoadRouter.validate_targets(self.backend_running_targets)
+            if not isinstance(self.static_backends, str) or set(
+                self.static_backends.split(",")
+            ) != set(self.backend_running_targets):
+                raise ValueError(
+                    "backend_running_targets must cover exactly the configured backend URLs"
+                )
         for name in (
             "engine_stats_interval",
             "leastqueue_metrics_max_age",
@@ -321,6 +338,7 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
             session_key=config.session_key,
             leastqueue_metrics_max_age=config.leastqueue_metrics_max_age,
             leastqueue_reservation_ttl=config.leastqueue_reservation_ttl,
+            backend_running_targets=config.backend_running_targets,
             max_instance_failover_reroute_attempts=config.max_instance_failover_reroute_attempts,
             priority_header=config.priority_header,
             priority_field=config.priority_field,
@@ -366,7 +384,7 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         if (
             self.current_config.service_discovery == "static"
             and self.current_config.routing_logic
-            in ("leastqueue", "leastkvperrequest", "roundrobin")
+            in ("leastqueue", "leastkvperrequest", "leastnormalizedload", "roundrobin")
         ):
             return self._reconfigure_static(config)
         self.reconfigure_service_discovery(config)
@@ -379,10 +397,11 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
         if config.service_discovery != "static" or config.routing_logic not in (
             "leastqueue",
             "leastkvperrequest",
+            "leastnormalizedload",
             "roundrobin",
         ):
             raise ValueError(
-                "Live static updates support leastqueue, leastkvperrequest and roundrobin only"
+                "Live static updates support leastqueue, leastkvperrequest, leastnormalizedload and roundrobin only"
             )
         supported = {
             "static_backends",
@@ -396,6 +415,7 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
             "routing_logic",
             "leastqueue_metrics_max_age",
             "leastqueue_reservation_ttl",
+            "backend_running_targets",
             "engine_stats_interval",
             "max_instance_failover_reroute_attempts",
         }
@@ -443,11 +463,14 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                 new_discovery.start_health_check_task()
         router = self.app.state.router
         if config.routing_logic != self.current_config.routing_logic:
-            router = {
-                "leastqueue": LeastQueueRouter,
-                "leastkvperrequest": LeastKVPerRequestRouter,
-                "roundrobin": RoundRobinRouter,
-            }[config.routing_logic]()
+            if config.routing_logic == "leastnormalizedload":
+                router = LeastNormalizedLoadRouter(config.backend_running_targets)
+            else:
+                router = {
+                    "leastqueue": LeastQueueRouter,
+                    "leastkvperrequest": LeastKVPerRequestRouter,
+                    "roundrobin": RoundRobinRouter,
+                }[config.routing_logic]()
         self.app.state.engine_stats_scraper.update_interval(
             config.engine_stats_interval
         )
@@ -456,9 +479,15 @@ class DynamicConfigWatcher(metaclass=SingletonMeta):
                 router.metrics_max_age = config.leastqueue_metrics_max_age
                 router.reservation_ttl = (
                     0
-                    if isinstance(router, LeastKVPerRequestRouter)
+                    if isinstance(
+                        router, (LeastKVPerRequestRouter, LeastNormalizedLoadRouter)
+                    )
                     else config.leastqueue_reservation_ttl
                 )
+                if isinstance(router, LeastNormalizedLoadRouter):
+                    router.backend_running_targets = dict(
+                        config.backend_running_targets
+                    )
         router.max_instance_failover_reroute_attempts = (
             config.max_instance_failover_reroute_attempts
         )

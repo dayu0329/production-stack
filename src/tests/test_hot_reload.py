@@ -11,11 +11,12 @@ import vllm_router.service_discovery as discovery_module
 from vllm_router.dynamic_config import DynamicConfigWatcher, DynamicRouterConfig
 from vllm_router.routers.routing_logic import (
     LeastKVPerRequestRouter,
+    LeastNormalizedLoadRouter,
     cleanup_routing_logic,
     initialize_routing_logic,
 )
 from vllm_router.service_discovery import StaticServiceDiscovery, get_service_discovery
-from vllm_router.stats.engine_stats import EngineStatsScraper
+from vllm_router.stats.engine_stats import EngineStats, EngineStatsScraper
 from vllm_router.utils import SingletonMeta
 from vllm_router.parsers.parser import parse_args
 
@@ -150,6 +151,69 @@ async def test_file_watcher_rejects_bad_yaml_then_applies_valid_replacement(
     finally:
         await asyncio.to_thread(watcher.close)
         SingletonMeta._instances.pop(DynamicConfigWatcher, None)
+
+
+def test_normalized_targets_update_atomically_and_switch_back(setup_reload):
+    app, config, watcher = setup_reload
+    targets = {"http://first:8000": 100, "http://second:8000": 30}
+    config = replace(
+        config, routing_logic="leastnormalizedload", backend_running_targets=targets
+    )
+    watcher.reconfigure_all(config)
+    router = app.state.router
+    discovery = get_service_discovery()
+    assert isinstance(router, LeastNormalizedLoadRouter)
+    stats = {
+        url: EngineStats.from_vllm_scrape(
+            f"vllm:num_requests_running {running}\nvllm:num_requests_waiting 0\n"
+        )
+        for url, running in zip(targets, (50, 20))
+    }
+    assert (
+        router.route_request(discovery.get_endpoint_info(), stats, {}, None)
+        == "http://first:8000"
+    )
+    for changes in (
+        {"backend_running_targets": {"http://first:8000": 100}},
+        {"backend_running_targets": {**targets, "http://second:8000": 0}},
+        {"static_backends": "http://first:8000,http://third:8000"},
+    ):
+        with pytest.raises(ValueError):
+            watcher.reconfigure_all(replace(config, **changes))
+        assert watcher.current_config is config
+        assert get_service_discovery() is discovery
+        assert app.state.router is router
+        assert router.backend_running_targets == targets
+    config = replace(
+        config, backend_running_targets={**targets, "http://second:8000": 200}
+    )
+    watcher.reconfigure_all(config)
+    assert app.state.router is router
+    assert get_service_discovery() is discovery
+    assert router.backend_running_targets["http://second:8000"] == 200
+    assert (
+        router.route_request(discovery.get_endpoint_info(), stats, {}, None)
+        == "http://second:8000"
+    )
+    config = replace(
+        config,
+        static_backends="http://third:8000",
+        static_models="test",
+        backend_running_targets={"http://third:8000": 50},
+    )
+    watcher.reconfigure_all(config)
+    assert get_service_discovery().urls == ["http://third:8000"]
+    assert router.backend_running_targets == {"http://third:8000": 50}
+    for policy in (
+        "leastqueue",
+        "leastkvperrequest",
+        "roundrobin",
+        "leastnormalizedload",
+    ):
+        config = replace(config, routing_logic=policy)
+        watcher.reconfigure_all(config)
+    assert app.state.router.backend_running_targets == {"http://third:8000": 50}
+    assert app.state.router.reservation_ttl == 0
 
 
 def test_user_example_parses():

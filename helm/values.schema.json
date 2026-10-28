@@ -883,12 +883,13 @@
                     }
                 },
                 "routingLogic": {
-                    "description": "routing logic, supports \"roundrobin\", \"leastqueue\", \"leastkvperrequest\", \"session\", \"prefixaware\", \"kvaware\", \"disaggregated_prefill\" or \"disaggregated_prefill_orchestrated\"",
+                    "description": "routing logic, supports \"roundrobin\", \"leastqueue\", \"leastkvperrequest\", \"leastnormalizedload\", \"session\", \"prefixaware\", \"kvaware\", \"disaggregated_prefill\" or \"disaggregated_prefill_orchestrated\"",
                     "type": "string",
                     "enum": [
                         "roundrobin",
                         "leastqueue",
                         "leastkvperrequest",
+                        "leastnormalizedload",
                         "session",
                         "prefixaware",
                         "kvaware",

@@ -1,6 +1,6 @@
 # vLLM Production Stack：面向生产环境的 vLLM 部署参考栈
 
-本 Fork 基于 [vLLM Production Stack](https://github.com/vllm-project/production-stack)，新增 `leastqueue`、`leastkvperrequest` 选路和静态后端热更新。使用这些功能时，需要从本仓库构建 Router 镜像。
+本 Fork 基于 [vLLM Production Stack](https://github.com/vllm-project/production-stack)，新增 `leastqueue`、`leastkvperrequest`、`leastnormalizedload` 选路和静态后端热更新。使用这些功能时，需要从本仓库构建 Router 镜像。
 
 | [**博客**](https://lmcache.github.io) | [**官方文档**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack 频道**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**意向登记表**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
@@ -126,6 +126,7 @@ Grafana 监控面板提供以下核心维度的可观测性洞察：
   - 轮询路由（Round-robin routing）
   - 最短队列路由（`leastqueue`）
   - 单个运行请求 KV 占用优先路由（`leastkvperrequest`）
+  - 目标并发归一化路由（`leastnormalizedload`）
   - 基于会话 ID 路由（Session-ID based routing）
   - 前缀感知路由（Prefix-aware routing，开发中）
 
@@ -167,6 +168,24 @@ vllm-router --port 8000 \
 Running 大于 0 时需要有效 KV 指标；Running 等于 0 时只需有效请求指标。有其他有效实例时排除指标缺失或过期的实例，所有实例指标不可用时在健康后端间轮转。静态模式支持在 `leastkvperrequest`、`leastqueue` 和 `roundrobin` 之间热切换。YAML 设置 `routing_logic: leastkvperrequest`，Helm 设置 `routerSpec.routingLogic: leastkvperrequest`。
 
 相关测试：`python -m pytest src/tests/test_leastkvperrequest_router.py src/tests/test_hot_reload.py -q`。
+
+### 目标并发归一化选路
+
+针对目标并发不同的静态后端，设置 `routing_logic: leastnormalizedload`。按 `(Waiting, 实际 Running / 目标 Running)` 升序选路，Waiting 始终优先，同分轮转。例如 Waiting 相同时，`50/100=0.5` 优先于 `20/30≈0.67`。目标值是容量权重，不是硬性上限；比值允许超过 1，Running=0 时比值为 0。不加入短时分配数，因此指标刷新前可能连续选择同一实例。
+
+完整示例位于 [`examples/wy-router/normalized-load.yaml`](./examples/wy-router/normalized-load.yaml)，目标值配置如下：
+
+```yaml
+backend_running_targets:
+  "http://vllm-1.example.com:8000": 100
+  "http://vllm-2.example.com:8000": 30
+```
+
+同时替换示例中 `static_models` 和目标映射内的后端 URL，然后运行 `vllm-router --dynamic-config-yaml examples/wy-router/normalized-load.yaml`。每个不同的后端 URL 必须恰好配置一个正整数目标值；缺失、多余 URL、布尔值和小数均会被拒绝。URL 必须完全匹配，包括末尾斜杠。同一 URL 服务多个模型时共享目标值。此模式要求静态服务发现，以便启用前检查全部后端配置。
+
+命令行可通过 `--backend-running-targets '{"http://vllm-1.example.com:8000":100,"http://vllm-2.example.com:8000":30}'` 指定映射，并提供相应的静态后端和模型参数。JSON 配置使用同样的对象结构。目标值与后端列表支持一起热更新，也支持与 `leastqueue`、`leastkvperrequest`、`roundrobin` 热切换。无效更新保留上一份成功配置；删除后端停止分配新请求，已有流继续处理。
+
+指标有效期沿用 `--leastqueue-metrics-max-age`（默认五秒），建议设置 `--engine-stats-interval 1`。请求指标缺失或过期时沿用健康后端回退规则。测试命令：`python -m pytest src/tests/test_leastnormalizedload_router.py src/tests/test_hot_reload.py src/tests/test_leastqueue_http.py -q`。
 
 ### 静态后端热更新
 

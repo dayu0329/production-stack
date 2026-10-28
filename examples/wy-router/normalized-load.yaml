@@ -1,0 +1,17 @@
+service_discovery: static
+routing_logic: leastnormalizedload
+
+static_models:
+  my-model:
+    static_model_type: chat
+    static_backends:
+      - http://vllm-1.example.com:8000
+      - http://vllm-2.example.com:8000
+
+backend_running_targets:
+  "http://vllm-1.example.com:8000": 100
+  "http://vllm-2.example.com:8000": 30
+
+engine_stats_interval: 1
+leastqueue_metrics_max_age: 5
+max_instance_failover_reroute_attempts: 1

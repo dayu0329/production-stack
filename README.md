@@ -1,6 +1,6 @@
 # vLLM Production Stack: reference stack for production vLLM deployment
 
-This fork adds `leastqueue` and `leastkvperrequest` routing and live updates for static router backends. It is based on [vLLM Production Stack](https://github.com/vllm-project/production-stack); the features below require a router image built from this repository.
+This fork adds `leastqueue`, `leastkvperrequest`, and `leastnormalizedload` routing and live updates for static router backends. It is based on [vLLM Production Stack](https://github.com/vllm-project/production-stack); the features below require a router image built from this repository.
 
 | [**Blog**](https://lmcache.github.io) | [**Docs**](https://docs.vllm.ai/projects/production-stack) | [**Production-Stack Slack Channel**](https://communityinviter.com/apps/vllm-dev/join-vllm-developers-slack) | [**LMCache Slack**](https://join.slack.com/t/lmcacheworkspace/shared_invite/zt-2viziwhue-5Amprc9k5hcIdXT7XevTaQ) | [**Interest Form**](https://forms.gle/mQfQDUXbKfp2St1z7) |
 
@@ -126,6 +126,7 @@ The router ensures efficient request distribution among backends. It supports:
   - Round-robin routing
   - Least-queue routing (`leastqueue`)
   - Least KV usage per running request (`leastkvperrequest`)
+  - Least normalized running load (`leastnormalizedload`)
   - Session-ID based routing
   - Prefix-aware routing (WIP)
 
@@ -169,6 +170,24 @@ Use `--engine-stats-interval 1` and `--leastqueue-metrics-max-age 5` as in the l
 Running greater than zero requires valid KV metrics. Running equal to zero needs only valid request metrics. Backends without fresh usable metrics are excluded while another backend has usable metrics; otherwise, healthy backends rotate. Static configurations can hot-switch between `leastkvperrequest`, `leastqueue`, and `roundrobin`. In YAML, set `routing_logic: leastkvperrequest`; in Helm, set `routerSpec.routingLogic: leastkvperrequest`.
 
 Run `python -m pytest src/tests/test_leastkvperrequest_router.py src/tests/test_hot_reload.py -q` to check the ratio policy and hot updates.
+
+### Least normalized running load
+
+For static backends with different target concurrency, set `routing_logic: leastnormalizedload`. The router sorts by `(Waiting, actual Running / target Running)`, then rotates equal scores. Waiting always takes priority. With equal Waiting, Running 50 against a target of 100 wins over Running 20 against a target of 30. A target is a relative capacity weight, not a hard limit: ratios can exceed 1, and zero Running scores 0. This mode uses measured Running without short-lived assignment compensation, so repeated requests can select the same backend until metrics refresh.
+
+Use [`examples/wy-router/normalized-load.yaml`](./examples/wy-router/normalized-load.yaml) as a complete starting configuration:
+
+```yaml
+backend_running_targets:
+  "http://vllm-1.example.com:8000": 100
+  "http://vllm-2.example.com:8000": 30
+```
+
+Replace the example URLs in both `static_models` and `backend_running_targets`, then run `vllm-router --dynamic-config-yaml examples/wy-router/normalized-load.yaml`. Every distinct backend URL must have exactly one positive integer target; missing targets, unknown URLs, booleans and fractional values are rejected. The URL must match exactly, including any trailing slash. Models sharing a URL share its target. This mode requires static service discovery so every backend can be validated before activation.
+
+CLI users can pass `--backend-running-targets '{"http://vllm-1.example.com:8000":100,"http://vllm-2.example.com:8000":30}'` with the corresponding static backends and models. JSON configuration uses the same object. Targets and backend lists can be hot-updated together, and static configurations can switch between this mode, `leastqueue`, `leastkvperrequest`, and `roundrobin`. Invalid updates retain the last successful configuration. Removed backends receive no new requests; existing streams continue.
+
+Metrics freshness uses `--leastqueue-metrics-max-age` (default 5 seconds); use `--engine-stats-interval 1`. Missing or stale request metrics follow the existing healthy-backend fallback. Tests: `python -m pytest src/tests/test_leastnormalizedload_router.py src/tests/test_hot_reload.py src/tests/test_leastqueue_http.py -q`.
 
 ### Live static backend updates
 

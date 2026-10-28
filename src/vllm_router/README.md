@@ -12,6 +12,7 @@ The source code for the request router.
   - Round-robin routing
   - Least-queue routing
   - Least KV usage per running request (`leastkvperrequest`)
+  - Least normalized running load (`leastnormalizedload`, static backends)
   - Session-ID based routing
   - (WIP) prefix-aware routing
 
@@ -37,10 +38,11 @@ The router can be configured using command-line arguments. Below are the availab
 
 ### Routing Logic Options
 
-- `--routing-logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, and `session`. This option is required.
+- `--routing-logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, `leastnormalizedload`, and `session`. This option is required.
 - `--session-key`: The key (in the header) to identify a session.
-- `--leastqueue-metrics-max-age`: Maximum age in seconds of backend metrics for `leastqueue` and `leastkvperrequest`. Default is `5`.
+- `--leastqueue-metrics-max-age`: Maximum age in seconds of backend metrics for `leastqueue`, `leastkvperrequest` and `leastnormalizedload`. Default is `5`.
 - `--leastqueue-reservation-ttl`: Seconds to count a new assignment against the backend's running requests. Default is `1`; `0` disables it.
+- `--backend-running-targets`: JSON object mapping every static backend URL to a positive integer target for `leastnormalizedload`. This strategy sorts by `(Waiting, actual Running / target Running)` and rotates ties. It shares `--leastqueue-metrics-max-age` and does not use reservation compensation. See the [complete configuration example](../../examples/wy-router/normalized-load.yaml).
 
 ### Monitoring Options
 
@@ -123,7 +125,7 @@ Currently, the dynamic config supports the following fields:
 **Required fields:**
 
 - `service_discovery`: The service discovery type. Options are `static` or `k8s`.
-- `routing_logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, and `session`.
+- `routing_logic`: The routing logic to use, including `roundrobin`, `leastqueue`, `leastkvperrequest`, `leastnormalizedload`, and `session`.
 
 **Optional fields:**
 
@@ -139,6 +141,7 @@ Currently, the dynamic config supports the following fields:
 - `leastqueue_metrics_max_age` and `leastqueue_reservation_ttl`: Metrics freshness and short-lived assignment settings for `leastqueue`.
 - `engine_stats_interval`: Backend metrics scrape interval in seconds.
 - `max_instance_failover_reroute_attempts`: Number of backend failover attempts.
+- `backend_running_targets`: URL-to-positive-integer map for `leastnormalizedload`. Targets are relative weights, not hard limits. Requires static discovery and exact coverage of backend URLs. Backend lists and targets can be updated together; invalid updates keep the previous configuration. Switching to/from the other static strategies is supported.
 
 Static `leastqueue` and `roundrobin` configurations can update backend URLs, model mappings, aliases, health-check settings, and the parameters above without restarting. They can also switch between these two strategies. Invalid updates retain the previous configuration. See the [root README](../../README.md#live-static-backend-updates) for a deployment example and limits.
 

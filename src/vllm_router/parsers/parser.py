@@ -91,7 +91,12 @@ def validate_static_model_types(model_types: str | None) -> None:
 # --- Argument Parsing and Initialization ---
 def validate_args(args):
     verify_required_args_provided(args)
-    if args.dynamic_config_yaml or args.dynamic_config_json:
+    if (
+        args.dynamic_config_yaml
+        or args.dynamic_config_json
+        or args.routing_logic == "leastnormalizedload"
+        or args.backend_running_targets is not None
+    ):
         from vllm_router.dynamic_config import DynamicRouterConfig
 
         DynamicRouterConfig.from_args(args).validate()
@@ -244,6 +249,7 @@ def parse_args():
             "roundrobin",
             "leastqueue",
             "leastkvperrequest",
+            "leastnormalizedload",
             "session",
             "kvaware",
             "loadaware",
@@ -258,7 +264,13 @@ def parse_args():
         "--leastqueue-metrics-max-age",
         type=float,
         default=5.0,
-        help="Maximum age in seconds of backend metrics for leastqueue and leastkvperrequest routing.",
+        help="Maximum age in seconds of backend metrics for leastqueue, leastkvperrequest and leastnormalizedload routing.",
+    )
+    parser.add_argument(
+        "--backend-running-targets",
+        type=json.loads,
+        default=None,
+        help="JSON object mapping each static backend URL to a positive integer running target.",
     )
     parser.add_argument(
         "--leastqueue-reservation-ttl",

@@ -57,6 +57,7 @@ class RoutingLogic(str, enum.Enum):
     ROUND_ROBIN = "roundrobin"
     LEAST_QUEUE = "leastqueue"
     LEAST_KV_PER_REQUEST = "leastkvperrequest"
+    LEAST_NORMALIZED_LOAD = "leastnormalizedload"
     SESSION_BASED = "session"
     KVAWARE = "kvaware"
     LOADAWARE = "loadaware"
@@ -337,6 +338,48 @@ class LeastKVPerRequestRouter(LeastQueueRouter):
             else 0.0
         )
         return stats.num_queuing_requests, ratio
+
+
+class LeastNormalizedLoadRouter(LeastQueueRouter):
+    def __init__(self, backend_running_targets=None, metrics_max_age: float = 5.0):
+        if hasattr(self, "_initialized"):
+            return
+        self.validate_targets(backend_running_targets)
+        super().__init__(metrics_max_age=metrics_max_age, reservation_ttl=0)
+        self.backend_running_targets = dict(backend_running_targets)
+
+    @staticmethod
+    def validate_targets(targets):
+        if not isinstance(targets, dict) or not targets:
+            raise ValueError(
+                "backend_running_targets must be a nonempty URL-to-integer map"
+            )
+        for url, target in targets.items():
+            if not isinstance(url, str):
+                raise ValueError("backend_running_targets keys must be backend URLs")
+            parsed = urlparse(url)
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in ("", "/")
+                or any(character.isspace() for character in url)
+            ):
+                raise ValueError(
+                    "backend_running_targets keys must be backend base URLs"
+                )
+            parsed.port
+            if type(target) is not int or target <= 0:
+                raise ValueError("Backend running targets must be positive integers")
+
+    def _score(self, url, stats):
+        return (
+            stats.num_queuing_requests,
+            stats.num_running_requests / self.backend_running_targets[url],
+        )
 
 
 class SessionRouter(RoutingInterface):
@@ -1343,6 +1386,11 @@ def initialize_routing_logic(
         router = LeastKVPerRequestRouter(
             metrics_max_age=kwargs.get("leastqueue_metrics_max_age", 5.0),
         )
+    elif routing_logic == RoutingLogic.LEAST_NORMALIZED_LOAD:
+        router = LeastNormalizedLoadRouter(
+            backend_running_targets=kwargs.get("backend_running_targets"),
+            metrics_max_age=kwargs.get("leastqueue_metrics_max_age", 5.0),
+        )
     elif routing_logic == RoutingLogic.SESSION_BASED:
         logger.info(f"Initializing session-based routing logic with kwargs: {kwargs}")
         router = SessionRouter(kwargs.get("session_key"))
@@ -1422,6 +1470,7 @@ def get_routing_logic() -> RoutingInterface:
         RoundRobinRouter,
         LeastQueueRouter,
         LeastKVPerRequestRouter,
+        LeastNormalizedLoadRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,
@@ -1441,6 +1490,7 @@ def cleanup_routing_logic():
         RoundRobinRouter,
         LeastQueueRouter,
         LeastKVPerRequestRouter,
+        LeastNormalizedLoadRouter,
         KvawareRouter,
         LoadAwareRouter,
         PrefixAwareRouter,
